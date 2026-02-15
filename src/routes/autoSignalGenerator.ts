@@ -523,7 +523,8 @@ router.post('/', async (_req, res) => {
           t.triggered_by === 'auto_strategy' &&
           new Date(t.created_at) >= dayStart
       );
-      if (config.max_trades_per_day > 0 && dailyTrades.length >= config.max_trades_per_day) {
+      const maxTradesPerDay = typeof config.max_trades_per_day === 'number' ? config.max_trades_per_day : 0;
+      if (maxTradesPerDay > 0 && dailyTrades.length >= maxTradesPerDay) {
         console.log(`Max trades per day reached for strategy ${config.id}`);
         continue;
       }
@@ -531,12 +532,14 @@ router.post('/', async (_req, res) => {
       const dailyPnl = trades
         .filter((t) => t.user_id === config.user_id && new Date(t.created_at) >= dayStart)
         .reduce((sum, t) => sum + Number(t.realized_pnl || 0), 0);
-      if (config.max_daily_loss > 0 && dailyPnl <= -config.max_daily_loss) {
+      const maxDailyLoss = typeof config.max_daily_loss === 'number' ? config.max_daily_loss : 0;
+      if (maxDailyLoss > 0 && dailyPnl <= -maxDailyLoss) {
         console.log(`Max daily loss reached for strategy ${config.id}`);
         continue;
       }
 
-      if (config.max_consecutive_losses > 0) {
+      const maxConsecutiveLosses = typeof config.max_consecutive_losses === 'number' ? config.max_consecutive_losses : 0;
+      if (maxConsecutiveLosses > 0) {
         const recent = trades
           .filter((t) => t.user_id === config.user_id && t.realized_pnl !== undefined)
           .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
@@ -551,7 +554,7 @@ router.post('/', async (_req, res) => {
           }
         }
 
-        if (consecutiveLosses >= config.max_consecutive_losses) {
+        if (consecutiveLosses >= maxConsecutiveLosses) {
           if (cooldownMinutes > 0 && lastLossAt) {
             const minutesSinceLoss = (Date.now() - lastLossAt.getTime()) / 60000;
             if (minutesSinceLoss < cooldownMinutes) {
@@ -865,28 +868,32 @@ router.post('/', async (_req, res) => {
                     }
                   }
 
-                  if (config.use_trailing_stop && config.trailing_stop_callback > 0) {
-                    const callbackRate = clampNumber(config.trailing_stop_callback, 0.1, 5);
-                    const activationPrice = config.trailing_stop_activation > 0
-                      ? side === 'BUY'
-                        ? price * (1 + config.trailing_stop_activation / 100)
-                        : price * (1 - config.trailing_stop_activation / 100)
-                      : 0;
-                    const params: Record<string, string> = {
-                      symbol: pair,
-                      side: closeSide,
-                      type: 'TRAILING_STOP_MARKET',
-                      callbackRate: callbackRate.toString(),
-                    };
-                    if (activationPrice > 0) {
-                      params.activationPrice = activationPrice.toFixed(2);
-                    }
-                    if (positionSide !== 'BOTH') {
-                      params.positionSide = positionSide;
-                    }
-                    const trailingResult = await callBinanceApi('/fapi/v1/order', apiKey, apiSecret, isTestnet, config.product, 'POST', params);
-                    if (!trailingResult.success) {
-                      tpSlErrors.push(trailingResult.error || 'Trailing stop failed');
+                  if (config.use_trailing_stop) {
+                    const trailingStopCallback = typeof config.trailing_stop_callback === 'number' ? config.trailing_stop_callback : 0;
+                    const trailingStopActivation = typeof config.trailing_stop_activation === 'number' ? config.trailing_stop_activation : 0;
+                    if (trailingStopCallback > 0) {
+                      const callbackRate = clampNumber(trailingStopCallback, 0.1, 5);
+                      const activationPrice = trailingStopActivation > 0
+                        ? side === 'BUY'
+                          ? price * (1 + trailingStopActivation / 100)
+                          : price * (1 - trailingStopActivation / 100)
+                        : 0;
+                      const params: Record<string, string> = {
+                        symbol: pair,
+                        side: closeSide,
+                        type: 'TRAILING_STOP_MARKET',
+                        callbackRate: callbackRate.toString(),
+                      };
+                      if (activationPrice > 0) {
+                        params.activationPrice = activationPrice.toFixed(2);
+                      }
+                      if (positionSide !== 'BOTH') {
+                        params.positionSide = positionSide;
+                      }
+                      const trailingResult = await callBinanceApi('/fapi/v1/order', apiKey, apiSecret, isTestnet, config.product, 'POST', params);
+                      if (!trailingResult.success) {
+                        tpSlErrors.push(trailingResult.error || 'Trailing stop failed');
+                      }
                     }
                   }
                 }
@@ -900,6 +907,7 @@ router.post('/', async (_req, res) => {
               }
             } else if (config.exchange === 'binance' && config.product === 'spot') {
               // Binance Spot order execution
+              // Note: Spot doesn't support leverage, so we skip leverage setting
               const side = signal.action === 'buy' ? 'BUY' : 'SELL';
               let orderResult: { success: boolean; data?: unknown; error?: string } = {
                 success: false,
@@ -945,58 +953,138 @@ router.post('/', async (_req, res) => {
                 orderId = orderData.orderId.toString();
                 orderSuccess = true;
                 console.log(`✅ ${pair}: Binance SPOT order SUCCESS - orderId: ${orderId}, quantity: ${quantity}`);
+
+                // Place SL/TP orders for spot (using STOP_LOSS_LIMIT and TAKE_PROFIT_LIMIT)
+                const tpSlErrors: string[] = [];
+                if (price > 0) {
+                  const closeSide = side === 'BUY' ? 'SELL' : 'BUY';
+                  const slPrice = side === 'BUY'
+                    ? price * (1 - config.stop_loss_percent / 100)
+                    : price * (1 + config.stop_loss_percent / 100);
+                  
+                  // For spot, we need to get current price for stop loss limit order
+                  // Using a small offset from stop price for limit order
+                  const slLimitPrice = side === 'BUY' 
+                    ? slPrice * 0.99  // Slightly below stop price for SELL
+                    : slPrice * 1.01; // Slightly above stop price for BUY
+
+                  const slQtyStr = formatQty(quantity, orderQtyDecimals ?? 3) || '0';
+                  const slResult = await callBinanceApi('/api/v3/order', apiKey, apiSecret, isTestnet, config.product, 'POST', {
+                    symbol: pair,
+                    side: closeSide,
+                    type: 'STOP_LOSS_LIMIT',
+                    timeInForce: 'GTC',
+                    quantity: slQtyStr,
+                    price: slLimitPrice.toFixed(2),
+                    stopPrice: slPrice.toFixed(2),
+                  });
+                  if (!slResult.success) {
+                    tpSlErrors.push(slResult.error || 'Stop loss failed');
+                  }
+
+                  const tpLevels = [
+                    { enabled: config.use_tp1, percent: config.tp1_percent, closePercent: config.tp1_close_percent },
+                    { enabled: config.use_tp2, percent: config.tp2_percent, closePercent: config.tp2_close_percent },
+                    { enabled: config.use_tp3, percent: config.tp3_percent, closePercent: config.tp3_close_percent },
+                  ];
+                  const decimals = orderQtyDecimals ?? 3;
+
+                  for (const tp of tpLevels) {
+                    if (!tp.enabled) continue;
+                    const tpPrice = side === 'BUY'
+                      ? price * (1 + tp.percent / 100)
+                      : price * (1 - tp.percent / 100);
+                    const tpQty = Math.floor(roundedQty * (tp.closePercent / 100) * 1000) / 1000;
+                    const tpQtyStr = formatQty(tpQty, decimals);
+
+                    if (tpQtyStr) {
+                      // For spot, use TAKE_PROFIT_LIMIT with limit price slightly better than trigger
+                      const tpLimitPrice = side === 'BUY'
+                        ? tpPrice * 1.01  // Slightly above for SELL
+                        : tpPrice * 0.99; // Slightly below for BUY
+
+                      const tpResult = await callBinanceApi('/api/v3/order', apiKey, apiSecret, isTestnet, config.product, 'POST', {
+                        symbol: pair,
+                        side: closeSide,
+                        type: 'TAKE_PROFIT_LIMIT',
+                        timeInForce: 'GTC',
+                        quantity: tpQtyStr,
+                        price: tpLimitPrice.toFixed(2),
+                        stopPrice: tpPrice.toFixed(2),
+                      });
+                      if (!tpResult.success) {
+                        tpSlErrors.push(tpResult.error || `TP${tp.percent} failed`);
+                      }
+                    }
+                  }
+                }
+                if (tpSlErrors.length > 0) {
+                  executionError = tpSlErrors.join(' | ');
+                }
               } else {
                 executionError = orderResult.error || 'Binance spot order failed';
                 console.log(`❌ ${pair}: Binance SPOT order FAILED - ${executionError}`);
               }
             } else if (config.exchange === 'bybit') {
               const positionIdx = typeof strategyConfig.position_idx === 'number' ? strategyConfig.position_idx : 0;
-              // Set leverage
-              const leverageResult = await callBybitApi(
-                '/v5/position/set-leverage',
-                apiKey,
-                apiSecret,
-                isTestnet,
-                'POST',
-                {
-                  category: 'linear',
-                  symbol: pair,
-                  buyLeverage: leverage.toString(),
-                  sellLeverage: leverage.toString(),
+              const category = config.product === 'spot' ? 'spot' : 'linear';
+              
+              // Set leverage only for futures (not for spot)
+              if (config.product === 'futures') {
+                const leverageResult = await callBybitApi(
+                  '/v5/position/set-leverage',
+                  apiKey,
+                  apiSecret,
+                  isTestnet,
+                  'POST',
+                  {
+                    category: 'linear',
+                    symbol: pair,
+                    buyLeverage: leverage.toString(),
+                    sellLeverage: leverage.toString(),
+                  }
+                );
+                if (!leverageResult.success) {
+                  executionError = leverageResult.error || 'Failed to set leverage';
+                  console.log(`❌ ${pair}: Failed to set leverage - ${executionError}`);
+                } else {
+                  console.log(`✅ ${pair}: Leverage set to ${leverage}x`);
                 }
-              );
-              if (!leverageResult.success) {
-                executionError = leverageResult.error || 'Failed to set leverage';
-                console.log(`❌ ${pair}: Failed to set leverage - ${executionError}`);
-              } else {
-                console.log(`✅ ${pair}: Leverage set to ${leverage}x`);
               }
 
               // Place market order
               const side = signal.action === 'buy' ? 'Buy' : 'Sell';
               let orderResult: { success: boolean; data?: unknown; error?: string } = {
                 success: false,
-                error: executionError || 'Failed to set leverage',
+                error: executionError || (config.product === 'futures' ? 'Failed to set leverage' : 'Initializing order'),
               };
-              if (!executionError) {
+              if (!executionError || config.product === 'spot') {
                 const attempts = [3, 2, 1, 0];
                 let lastError: string | undefined;
                 for (const decimals of attempts) {
                   const qtyStr = formatQty(quantity, decimals);
                   if (!qtyStr) continue;
+                  const orderParams: Record<string, string> = {
+                    category,
+                    symbol: pair,
+                    side,
+                    orderType: 'Market',
+                    qty: qtyStr,
+                  };
+                  
+                  // For spot, we might need different parameters
+                  if (config.product === 'spot') {
+                    // Spot orders might need different format
+                    // Bybit spot uses 'spot' category
+                  }
+                  
                   const attemptResult = await callBybitApi(
                     '/v5/order/create',
                     apiKey,
                     apiSecret,
                     isTestnet,
                     'POST',
-                    {
-                      category: 'linear',
-                      symbol: pair,
-                      side,
-                      orderType: 'Market',
-                      qty: qtyStr,
-                    }
+                    orderParams
                   );
                   if (attemptResult.success) {
                     orderResult = attemptResult;
@@ -1018,21 +1106,24 @@ router.post('/', async (_req, res) => {
                 const orderData = orderResult.data as { result?: { orderId?: string } };
                 orderId = orderData.result?.orderId;
                 orderSuccess = true;
-                console.log(`✅ ${pair}: Bybit order SUCCESS - orderId: ${orderId}, quantity: ${quantity}`);
+                console.log(`✅ ${pair}: Bybit ${config.product.toUpperCase()} order SUCCESS - orderId: ${orderId}, quantity: ${quantity}`);
 
-                // Place SL/TP orders
-                if (price > 0) {
+                // Place SL/TP orders (only for futures - spot doesn't support position-based SL/TP)
+                if (price > 0 && config.product === 'futures') {
                   const slPrice = side === 'Buy'
                     ? price * (1 - config.stop_loss_percent / 100)
                     : price * (1 + config.stop_loss_percent / 100);
 
-                  await callBybitApi('/v5/position/trading-stop', apiKey, apiSecret, isTestnet, 'POST', {
+                  const slResult = await callBybitApi('/v5/position/trading-stop', apiKey, apiSecret, isTestnet, 'POST', {
                     category: 'linear',
                     symbol: pair,
-                    positionIdx: 0,
+                    positionIdx,
                     stopLoss: slPrice.toFixed(2),
                     slTriggerBy: 'LastPrice',
                   });
+                  if (!slResult.success) {
+                    executionError = slResult.error || 'Bybit stop loss failed';
+                  }
 
                   const closeSide = side === 'Buy' ? 'Sell' : 'Buy';
                   const tpLevels = [
@@ -1068,27 +1159,36 @@ router.post('/', async (_req, res) => {
                     }
                   }
 
-                  if (config.use_trailing_stop && config.trailing_stop_callback > 0) {
-                    const trailingDistance = price * (config.trailing_stop_callback / 100);
-                    const activePrice = config.trailing_stop_activation > 0
-                      ? side === 'Buy'
-                        ? price * (1 + config.trailing_stop_activation / 100)
-                        : price * (1 - config.trailing_stop_activation / 100)
-                      : 0;
-                    const params: Record<string, unknown> = {
-                      category: 'linear',
-                      symbol: pair,
-                      positionIdx,
-                      trailingStop: trailingDistance.toFixed(2),
-                    };
-                    if (activePrice > 0) {
-                      params.activePrice = activePrice.toFixed(2);
-                    }
-                    const trailingResult = await callBybitApi('/v5/position/trading-stop', apiKey, apiSecret, isTestnet, 'POST', params);
-                    if (!trailingResult.success) {
-                      executionError = trailingResult.error || 'Bybit trailing stop failed';
+                  if (config.use_trailing_stop) {
+                    const trailingStopCallback = typeof config.trailing_stop_callback === 'number' ? config.trailing_stop_callback : 0;
+                    const trailingStopActivation = typeof config.trailing_stop_activation === 'number' ? config.trailing_stop_activation : 0;
+                    if (trailingStopCallback > 0) {
+                      const trailingDistance = price * (trailingStopCallback / 100);
+                      const activePrice = trailingStopActivation > 0
+                        ? side === 'Buy'
+                          ? price * (1 + trailingStopActivation / 100)
+                          : price * (1 - trailingStopActivation / 100)
+                        : 0;
+                      const params: Record<string, unknown> = {
+                        category: 'linear',
+                        symbol: pair,
+                        positionIdx,
+                        trailingStop: trailingDistance.toFixed(2),
+                      };
+                      if (activePrice > 0) {
+                        params.activePrice = activePrice.toFixed(2);
+                      }
+                      const trailingResult = await callBybitApi('/v5/position/trading-stop', apiKey, apiSecret, isTestnet, 'POST', params);
+                      if (!trailingResult.success) {
+                        executionError = trailingResult.error || 'Bybit trailing stop failed';
+                      }
                     }
                   }
+                } else if (config.product === 'spot') {
+                  // For Bybit spot, SL/TP are handled via conditional orders
+                  // Note: Bybit spot doesn't support position-based SL/TP like futures
+                  // You would need to use conditional orders or OCO orders
+                  console.log(`⚠️ ${pair}: Bybit Spot SL/TP not implemented - spot trading requires conditional orders`);
                 }
               }
               if (!orderResult.success) {
@@ -1105,7 +1205,7 @@ router.post('/', async (_req, res) => {
                 id: tradeId,
                 user_id: config.user_id,
                 exchange: config.exchange,
-                environment: config.environment,
+                environment: config.environment as 'testnet' | 'mainnet',
                 symbol: pair,
                 side: signal.action,
                 order_type: 'market',
@@ -1125,13 +1225,14 @@ router.post('/', async (_req, res) => {
                 id: positionId,
                 user_id: config.user_id,
                 exchange: config.exchange,
-                environment: config.environment,
+                environment: config.environment as 'testnet' | 'mainnet',
                 symbol: pair,
                 side: signal.action === 'buy' ? 'long' : 'short',
                 size: quantity,
                 entry_price: signal.price,
                 leverage,
                 is_open: true,
+                unrealized_pnl: 0,
                 stop_loss:
                   signal.action === 'buy'
                     ? signal.price * (1 - config.stop_loss_percent / 100)
@@ -1250,7 +1351,7 @@ router.post('/', async (_req, res) => {
             }
           } else {
             console.log(`❌ ${pair}: Signal FILTERED - shouldExecute: false, skipReason: ${skipReason}`);
-            if (signal.action !== 'none') {
+            if (signal.action === 'buy' || signal.action === 'sell') {
               const webhookLogId = crypto.randomUUID();
               db.data?.webhook_logs.push({
                 id: webhookLogId,
@@ -1286,12 +1387,12 @@ router.post('/', async (_req, res) => {
             results.push({
               strategy: config.name,
               pair,
-              signal: signal.action === 'none' ? null : {
+              signal: (signal.action === 'buy' || signal.action === 'sell') ? {
                 action: signal.action,
                 symbol: pair,
                 price: signal.price,
                 confidence: signal.confidence,
-              },
+              } : null,
               executed: false,
               reason: skipReason || 'Signal filtered',
             });
