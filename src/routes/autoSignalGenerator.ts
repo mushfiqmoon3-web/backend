@@ -685,24 +685,29 @@ router.post('/', async (_req, res) => {
 
           if (!engineConfidenceOk) {
             skipReason = 'Confidence below threshold';
+            console.log(`❌ ${pair}: Engine confidence ${(signal.confidence * 100).toFixed(1)}% < threshold ${(minConfidence * 100).toFixed(1)}%`);
           } else {
             const decision = await getGeminiFilterDecision(signal, config.auto_signal_indicators);
             if (decision.ok) {
               geminiDecision = decision;
+              console.log(`🤖 ${pair}: Gemini decision - execute: ${decision.execute}, confidence: ${(decision.confidence * 100).toFixed(1)}%, reason: ${decision.reason}`);
               if (decision.execute && decision.confidence >= minConfidence) {
                 shouldExecute = true;
               } else {
                 skipReason = decision.reason || 'Gemini rejected signal';
+                console.log(`❌ ${pair}: Gemini REJECTED - ${skipReason}`);
               }
             } else {
               // Gemini unavailable -> fallback to engine signal
               shouldExecute = true;
               skipReason = `Gemini unavailable: ${decision.reason || 'unknown_error'}`;
+              console.log(`⚠️ ${pair}: Gemini unavailable, using engine signal only`);
             }
           }
 
           // Only execute if signal confidence >= 0.80 (80%) and Gemini filter passes (or Gemini fails)
           if (shouldExecute) {
+            console.log(`✅ ${pair}: Signal approved for execution - action: ${signal.action}, price: ${signal.price}, confidence: ${(signal.confidence * 100).toFixed(1)}%`);
             const leverage = config.default_leverage;
             const price = signal.price;
 
@@ -756,6 +761,9 @@ router.post('/', async (_req, res) => {
               );
               if (!leverageResult.success) {
                 executionError = leverageResult.error || 'Failed to set leverage';
+                console.log(`❌ ${pair}: Failed to set leverage - ${executionError}`);
+              } else {
+                console.log(`✅ ${pair}: Leverage set to ${leverage}x`);
               }
 
               // Place market order
@@ -805,6 +813,7 @@ router.post('/', async (_req, res) => {
                 const orderData = orderResult.data as { orderId: number };
                 orderId = orderData.orderId.toString();
                 orderSuccess = true;
+                console.log(`✅ ${pair}: Binance order SUCCESS - orderId: ${orderId}, quantity: ${quantity}`);
 
                 // Place SL/TP orders
                 const tpSlErrors: string[] = [];
@@ -887,6 +896,58 @@ router.post('/', async (_req, res) => {
               }
               if (!orderResult.success) {
                 executionError = orderResult.error || 'Binance order failed';
+                console.log(`❌ ${pair}: Binance order FAILED - ${executionError}`);
+              }
+            } else if (config.exchange === 'binance' && config.product === 'spot') {
+              // Binance Spot order execution
+              const side = signal.action === 'buy' ? 'BUY' : 'SELL';
+              let orderResult: { success: boolean; data?: unknown; error?: string } = {
+                success: false,
+                error: 'Initializing spot order',
+              };
+
+              const attempts = [8, 6, 4, 3, 2, 1, 0];
+              let lastError: string | undefined;
+              for (const decimals of attempts) {
+                const qtyStr = formatQty(quantity, decimals);
+                if (!qtyStr) continue;
+                const attemptResult = await callBinanceApi(
+                  '/api/v3/order',
+                  apiKey,
+                  apiSecret,
+                  isTestnet,
+                  config.product,
+                  'POST',
+                  {
+                    symbol: pair,
+                    side,
+                    type: 'MARKET',
+                    quantity: qtyStr,
+                  }
+                );
+                if (attemptResult.success) {
+                  orderResult = attemptResult;
+                  orderQtyDecimals = decimals;
+                  break;
+                }
+                lastError = attemptResult.error;
+                if (!isPrecisionError(attemptResult.error)) {
+                  orderResult = attemptResult;
+                  break;
+                }
+              }
+              if (!orderResult.success && lastError) {
+                orderResult = { success: false, error: lastError };
+              }
+
+              if (orderResult.success) {
+                const orderData = orderResult.data as { orderId: number };
+                orderId = orderData.orderId.toString();
+                orderSuccess = true;
+                console.log(`✅ ${pair}: Binance SPOT order SUCCESS - orderId: ${orderId}, quantity: ${quantity}`);
+              } else {
+                executionError = orderResult.error || 'Binance spot order failed';
+                console.log(`❌ ${pair}: Binance SPOT order FAILED - ${executionError}`);
               }
             } else if (config.exchange === 'bybit') {
               const positionIdx = typeof strategyConfig.position_idx === 'number' ? strategyConfig.position_idx : 0;
@@ -906,6 +967,9 @@ router.post('/', async (_req, res) => {
               );
               if (!leverageResult.success) {
                 executionError = leverageResult.error || 'Failed to set leverage';
+                console.log(`❌ ${pair}: Failed to set leverage - ${executionError}`);
+              } else {
+                console.log(`✅ ${pair}: Leverage set to ${leverage}x`);
               }
 
               // Place market order
@@ -954,6 +1018,7 @@ router.post('/', async (_req, res) => {
                 const orderData = orderResult.data as { result?: { orderId?: string } };
                 orderId = orderData.result?.orderId;
                 orderSuccess = true;
+                console.log(`✅ ${pair}: Bybit order SUCCESS - orderId: ${orderId}, quantity: ${quantity}`);
 
                 // Place SL/TP orders
                 if (price > 0) {
@@ -1028,10 +1093,12 @@ router.post('/', async (_req, res) => {
               }
               if (!orderResult.success) {
                 executionError = orderResult.error || 'Bybit order failed';
+                console.log(`❌ ${pair}: Bybit order FAILED - ${executionError}`);
               }
             }
 
             if (orderSuccess && orderId) {
+              console.log(`✅ ${pair}: Trade EXECUTION SUCCESS - Recording trade and position in database`);
               // Record trade in database
               const tradeId = crypto.randomUUID();
               const trade: Trade = {
@@ -1136,6 +1203,7 @@ router.post('/', async (_req, res) => {
                 `✅ Auto signal EXECUTED: ${pair} ${signal.action} for strategy ${config.name} | Signal confidence: ${(signal.confidence * 100).toFixed(1)}%`
               );
             } else {
+              console.log(`❌ ${pair}: Trade EXECUTION FAILED - orderSuccess: ${orderSuccess}, orderId: ${orderId || 'missing'}, error: ${executionError || 'unknown'}`);
               const webhookLogId = crypto.randomUUID();
               db.data?.webhook_logs.push({
                 id: webhookLogId,
@@ -1181,6 +1249,7 @@ router.post('/', async (_req, res) => {
               });
             }
           } else {
+            console.log(`❌ ${pair}: Signal FILTERED - shouldExecute: false, skipReason: ${skipReason}`);
             if (signal.action !== 'none') {
               const webhookLogId = crypto.randomUUID();
               db.data?.webhook_logs.push({
